@@ -3,20 +3,18 @@ package com.example.spannerloadgenerator;
 import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutures;
 import com.google.api.gax.rpc.AlreadyExistsException;
+import com.google.cloud.opentelemetry.metric.GoogleCloudMetricExporter;
+import com.google.cloud.opentelemetry.metric.MetricConfiguration;
 import com.google.cloud.spanner.*;
-import com.google.cloud.spanner.AsyncRunner.AsyncWork; // MODIFIED: Added import
-import com.google.cloud.spanner.Options.TransactionOption;
-// Removed unused import for TransactionCallable as we are using AsyncWork for writes
-// import com.google.cloud.spanner.TransactionRunner.TransactionCallable;
-import io.opencensus.exporter.stats.stackdriver.StackdriverStatsExporter;
+import com.google.cloud.spanner.AsyncRunner.AsyncWork;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.RateLimiter;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import picocli.CommandLine;
-import picocli.CommandLine.Command;
-import picocli.CommandLine.Option;
-
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.export.MetricExporter;
+import io.opentelemetry.sdk.metrics.export.PeriodicMetricReader;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -27,12 +25,18 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
 
 @Command(
     name = "spanner-load-generator",
     mixinStandardHelpOptions = true,
-    version = "Spanner Load Generator 1.5.3", // Version updated
-    description = "Generates configurable asynchronous load on a Google Cloud Spanner database.")
+    version = "Spanner Load Generator 2.0.0", // Version updated for OTEL support
+    description =
+        "Generates configurable asynchronous load on a Google Cloud Spanner database with OpenTelemetry metrics.")
 public class SpannerLoadGenerator implements Callable<Integer> {
 
   private static final Logger logger = LoggerFactory.getLogger(SpannerLoadGenerator.class);
@@ -151,6 +155,37 @@ public class SpannerLoadGenerator implements Callable<Integer> {
       description = "Total run duration in minutes. 0 means run indefinitely. Default: 0.")
   private long runDurationMinutes;
 
+  // --- Dynamic Channel Pool (DCP) Parameters ---
+  @Option(
+      names = {"--disable-dcp"},
+      arity = "0..1",
+      defaultValue = "false",
+      fallbackValue = "true",
+      description =
+          "Disable dynamic channel pooling (uses static channel count via --num-channels). Default: false (DCP enabled).")
+  private boolean disableDcp;
+
+  @Option(
+      names = {"--num-channels"},
+      defaultValue = "4",
+      description = "Number of gRPC channels when DCP is disabled. Default: 4.")
+  private int numChannels;
+
+  // --- OpenTelemetry Parameters ---
+  @Option(
+      names = {"--enable-otel-metrics"},
+      arity = "0..1",
+      defaultValue = "true",
+      fallbackValue = "true",
+      description = "Enable OpenTelemetry metrics export to Cloud Monitoring. Default: true.")
+  private boolean enableOtelMetrics;
+
+  @Option(
+      names = {"--otel-export-interval-seconds"},
+      defaultValue = "60",
+      description = "OpenTelemetry metrics export interval in seconds. Default: 60.")
+  private int otelExportIntervalSeconds;
+
   // --- Internal State ---
   private Spanner spanner;
   private DatabaseClient dbClient;
@@ -165,12 +200,51 @@ public class SpannerLoadGenerator implements Callable<Integer> {
   private final AtomicReference<Double> currentTargetQps;
   private ScheduledFuture<?> qpsSteppingTaskFuture = null;
   private Semaphore asyncOpPermits;
-
-  // private static final TransactionOption[] NO_TRANSACTION_OPTIONS = new TransactionOption[0]; //
-  // Not needed if using AsyncWork
+  private OpenTelemetry openTelemetry;
+  private SdkMeterProvider meterProvider;
 
   public SpannerLoadGenerator() {
     this.currentTargetQps = new AtomicReference<>(0.0);
+  }
+
+  /** Initializes OpenTelemetry with GCP Cloud Monitoring exporter. */
+  private void initializeOpenTelemetry() {
+    if (!enableOtelMetrics) {
+      logger.info("OpenTelemetry metrics disabled.");
+      openTelemetry = OpenTelemetry.noop();
+      return;
+    }
+
+    try {
+      logger.info("Initializing OpenTelemetry with GCP Cloud Monitoring exporter...");
+
+      // Create GCP Cloud Monitoring metric exporter
+      MetricExporter metricExporter =
+          GoogleCloudMetricExporter.createWithConfiguration(
+              MetricConfiguration.builder().setProjectId(projectId).build());
+
+      // Create meter provider with periodic metric reader
+      meterProvider =
+          SdkMeterProvider.builder()
+              .registerMetricReader(
+                  PeriodicMetricReader.builder(metricExporter)
+                      .setInterval(Duration.ofSeconds(otelExportIntervalSeconds))
+                      .build())
+              .build();
+
+      // Build OpenTelemetry SDK
+      openTelemetry = OpenTelemetrySdk.builder().setMeterProvider(meterProvider).build();
+
+      // Enable OpenTelemetry metrics in Spanner
+      SpannerOptions.enableOpenTelemetryMetrics();
+
+      logger.info(
+          "OpenTelemetry initialized successfully. Metrics will be exported every {} seconds.",
+          otelExportIntervalSeconds);
+    } catch (Exception e) {
+      logger.error("Failed to initialize OpenTelemetry: {}", e.getMessage(), e);
+      openTelemetry = OpenTelemetry.noop();
+    }
   }
 
   private void ensureTableExists() {
@@ -297,13 +371,15 @@ public class SpannerLoadGenerator implements Callable<Integer> {
         numLoadRows);
     logger.info("Config - Max Async In-flight: {}", maxAsyncInflight);
     logger.info(
-        "Config - QPS: Start={}, End={}, Step={}, Interval={}s, Burst={}",
-        startQPS,
-        (endQPS > 0 ? endQPS : "Unlimited"),
-        stepQPS,
-        intervalSeconds,
-        burstMode);
+        "Config - QPS: Start={}, End={}, Step={}%, Interval={}s, Burst={}",
+        startQPS, (endQPS > 0 ? endQPS : "Unlimited"), stepQPS, intervalSeconds, burstMode);
     logger.info("Config - Threads: {}, Run Duration: {} min", numThreads, runDurationMinutes);
+    logger.info(
+        "Config - DCP Enabled: {}, Num Channels (if DCP disabled): {}", !disableDcp, numChannels);
+    logger.info(
+        "Config - OpenTelemetry Metrics: {}, Export Interval: {}s",
+        enableOtelMetrics,
+        otelExportIntervalSeconds);
 
     if ((workloadType == WorkloadType.READ || workloadType == WorkloadType.READ_WRITE)
         && numLoadRows == 0) {
@@ -314,8 +390,30 @@ public class SpannerLoadGenerator implements Callable<Integer> {
 
     asyncOpPermits = new Semaphore(maxAsyncInflight);
 
-    SpannerOptions options =
-        SpannerOptions.newBuilder().setProjectId(projectId).enableGrpcGcpExtension().build();
+    // Initialize OpenTelemetry before creating Spanner client
+    initializeOpenTelemetry();
+
+    // Build SpannerOptions with DCP configuration
+    SpannerOptions.Builder optionsBuilder =
+        SpannerOptions.newBuilder().setProjectId(projectId).setOpenTelemetry(openTelemetry);
+
+    if (disableDcp) {
+      // Disable DCP and grpc-gcp extension entirely - use traditional GAX channel pool
+      // This gives a true "before DCP" baseline for comparison
+      logger.info(
+          "Dynamic Channel Pool DISABLED. Using GAX channel pool with {} static channels.",
+          numChannels);
+      optionsBuilder.disableGrpcGcpExtension();
+      optionsBuilder.setNumChannels(numChannels);
+    } else {
+      // Enable DCP - requires both enableGrpcGcpExtension() AND enableDynamicChannelPool()
+      // Note: grpc-gcp is enabled by default in 6.105.0, but DCP requires explicit enablement
+      logger.info("Dynamic Channel Pool ENABLED (grpc-gcp-java with DCP).");
+      optionsBuilder.enableGrpcGcpExtension();
+      optionsBuilder.enableDynamicChannelPool();
+    }
+
+    SpannerOptions options = optionsBuilder.build();
     spanner = options.getService();
     DatabaseId db = DatabaseId.of(projectId, instanceId, databaseId);
     dbClient = spanner.getDatabaseClient(db);
@@ -323,7 +421,7 @@ public class SpannerLoadGenerator implements Callable<Integer> {
     ensureTableExists();
     if (!running.get()) {
       logger.error("Could not ensure table exists. Exiting.");
-      if (spanner != null) spanner.close();
+      cleanup();
       return 1;
     }
 
@@ -378,6 +476,11 @@ public class SpannerLoadGenerator implements Callable<Integer> {
       }
     }
 
+    cleanup();
+    return 0;
+  }
+
+  private void cleanup() {
     logger.info("Entering final shutdown sequence...");
 
     if (controlScheduler != null && !controlScheduler.isShutdown()) {
@@ -432,13 +535,23 @@ public class SpannerLoadGenerator implements Callable<Integer> {
       }
     }
 
+    // Shutdown OpenTelemetry meter provider
+    if (meterProvider != null) {
+      try {
+        logger.info("Shutting down OpenTelemetry meter provider...");
+        meterProvider.shutdown().join(30, TimeUnit.SECONDS);
+        logger.info("OpenTelemetry meter provider shut down successfully.");
+      } catch (Exception e) {
+        logger.warn("Error shutting down OpenTelemetry: {}", e.getMessage());
+      }
+    }
+
     if (spanner != null) spanner.close();
     logger.info("Spanner client closed. Load generator finished.");
     logger.info(
         "Final Stats (Main Run Phase): Total Successful Ops: {}, Total Failed Ops: {}",
         totalSuccessfulOperations.get(),
         totalFailedOperations.get());
-    return 0;
   }
 
   private void scheduleQpsControl() {
@@ -465,9 +578,8 @@ public class SpannerLoadGenerator implements Callable<Integer> {
                   && (qpsSteppingTaskFuture == null || qpsSteppingTaskFuture.isDone())) {
                 logger.info(
                     "Main Run: Starting QPS stepping after burst attempt (no change due to endQPS)."
-                        + " Interval: {}s, Step: {}.",
-                    intervalSeconds,
-                    stepQPS);
+                        + " Interval: {}s, Step: {}%.",
+                    intervalSeconds, stepQPS);
                 if (qpsSteppingTaskFuture != null) qpsSteppingTaskFuture.cancel(false);
                 qpsSteppingTaskFuture =
                     controlScheduler.scheduleAtFixedRate(
@@ -480,9 +592,8 @@ public class SpannerLoadGenerator implements Callable<Integer> {
             logger.info("MAIN RUN BURST: QPS set to {}.", burstTargetQps);
             if (intervalSeconds > 0 && stepQPS > 0) {
               logger.info(
-                  "Main Run: Starting QPS stepping after burst. Interval: {}s, Step: {}.",
-                  intervalSeconds,
-                  stepQPS);
+                  "Main Run: Starting QPS stepping after burst. Interval: {}s, Step: {}%.",
+                  intervalSeconds, stepQPS);
               if (qpsSteppingTaskFuture != null) qpsSteppingTaskFuture.cancel(false);
               qpsSteppingTaskFuture =
                   controlScheduler.scheduleAtFixedRate(
@@ -493,10 +604,8 @@ public class SpannerLoadGenerator implements Callable<Integer> {
           TimeUnit.MINUTES);
     } else if (intervalSeconds > 0 && stepQPS > 0) {
       logger.info(
-          "Main Run: QPS stepping enabled (no burst). Initial delay: {}s, Interval: {}s, Step: {}.",
-          intervalSeconds,
-          intervalSeconds,
-          stepQPS);
+          "Main Run: QPS stepping enabled (no burst). Initial delay: {}s, Interval: {}s, Step: {}%.",
+          intervalSeconds, intervalSeconds, stepQPS);
       if (qpsSteppingTaskFuture != null) qpsSteppingTaskFuture.cancel(false);
       qpsSteppingTaskFuture =
           controlScheduler.scheduleAtFixedRate(
@@ -521,7 +630,7 @@ public class SpannerLoadGenerator implements Callable<Integer> {
           currentRate);
       return;
     }
-    double nextRateCandidate = currentRate + (currentRate * stepQPS)/100;
+    double nextRateCandidate = currentRate + (currentRate * stepQPS) / 100;
     double newEffectiveRate = nextRateCandidate;
     if (endQPS > 0) newEffectiveRate = Math.min(nextRateCandidate, endQPS);
     if (newEffectiveRate < 0) newEffectiveRate = 0;
@@ -561,14 +670,15 @@ public class SpannerLoadGenerator implements Callable<Integer> {
               String.format(
                   "STATS (Main Run): Target QPS: %.2f, Actual QPS (last 5s): %.2f, Success Ops"
                       + " (5s): %d, Failed Ops (5s): %d, Total Success Ops: %d, Total Failed Ops:"
-                      + " %d, In-Flight Async: %d",
+                      + " %d, In-Flight Async: %d, DCP: %s",
                   currentEffectiveTargetQps,
                   actualQpsInInterval,
                   sucInInterval,
                   failInInterval,
                   totalSuccessfulOperations.get(),
                   totalFailedOperations.get(),
-                  maxAsyncInflight - asyncOpPermits.availablePermits()));
+                  maxAsyncInflight - asyncOpPermits.availablePermits(),
+                  disableDcp ? "DISABLED" : "ENABLED"));
         },
         5,
         5,
@@ -623,20 +733,10 @@ public class SpannerLoadGenerator implements Callable<Integer> {
                 String.format(
                     "Async %s data. Ts: %d. Worker: %s",
                     currentOpTypeStr, System.currentTimeMillis(), Thread.currentThread().getName());
-            // final Mutation mutation =
-            //     Mutation.newInsertOrUpdateBuilder(tableName)
-            //         .set("Id")
-            //         .to(idForOp)
-            //         .set("Data")
-            //         .to(data)
-            //         .set("LastUpdated")
-            //         .to(Value.COMMIT_TIMESTAMP)
-            //         .build();
 
-            // MODIFIED: Use AsyncWork and pass executor
+            // Use AsyncWork and pass executor
             AsyncWork<Long> writeWork =
-                transaction -> { // transaction is AsyncTransactionContext
-                  // transaction.buffer(mutation);
+                transaction -> {
                   long rowIndex = (numLoadRows == 1) ? 0 : random.nextInt((int) numLoadRows);
                   String idToUse = String.format("load-row-%d", rowIndex);
                   String sql =
@@ -736,12 +836,6 @@ public class SpannerLoadGenerator implements Callable<Integer> {
     System.setProperty("org.slf4j.simpleLogger.showThreadName", "false");
     System.setProperty("org.slf4j.simpleLogger.showDateTime", "true");
     System.setProperty("org.slf4j.simpleLogger.dateTimeFormat", "yyyy-MM-dd HH:mm:ss.SSS");
-
-    try {
-      StackdriverStatsExporter.createAndRegister();
-    } catch (Exception e) {
-      logger.error("Failed to register StackdriverStatsExporter: {}", e.getMessage(), e);
-    }
 
     int exitCode = new CommandLine(new SpannerLoadGenerator()).execute(args);
     System.exit(exitCode);
