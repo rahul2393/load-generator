@@ -729,6 +729,7 @@ public class SpannerLoadGenerator implements Callable<Integer> {
             } else {
               idForOp = UUID.randomUUID().toString();
             }
+            final String writeId = idForOp; // Capture for use in lambda
             final String data =
                 String.format(
                     "Async %s data. Ts: %d. Worker: %s",
@@ -737,16 +738,28 @@ public class SpannerLoadGenerator implements Callable<Integer> {
             // Use AsyncWork and pass executor
             AsyncWork<Long> writeWork =
                 transaction -> {
-                  long rowIndex = (numLoadRows == 1) ? 0 : random.nextInt((int) numLoadRows);
-                  String idToUse = String.format("load-row-%d", rowIndex);
-                  String sql =
-                      "UPDATE "
-                          + tableName
-                          + " SET Data = '"
-                          + data
-                          + "' WHERE Id = '"
-                          + idToUse
-                          + "'";
+                  String sql;
+                  if (numLoadRows > 0) {
+                    // UPDATE existing row
+                    sql =
+                        "UPDATE "
+                            + tableName
+                            + " SET Data = '"
+                            + data
+                            + "' WHERE Id = '"
+                            + writeId
+                            + "'";
+                  } else {
+                    // INSERT new row (no pre-loaded rows exist)
+                    sql =
+                        "INSERT INTO "
+                            + tableName
+                            + " (Id, Data, LastUpdated) VALUES ('"
+                            + writeId
+                            + "', '"
+                            + data
+                            + "', PENDING_COMMIT_TIMESTAMP())";
+                  }
                   return transaction.executeUpdateAsync(Statement.of(sql));
                 };
             future = dbClient.runAsync().runAsync(writeWork, MoreExecutors.directExecutor());
